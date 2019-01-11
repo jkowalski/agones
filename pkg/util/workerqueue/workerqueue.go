@@ -54,9 +54,14 @@ type WorkerQueue struct {
 
 // NewWorkerQueue returns a new worker queue for a given name
 func NewWorkerQueue(handler Handler, logger *logrus.Entry, name string) *WorkerQueue {
+	return NewWorkerQueueWithRateLimiter(handler, logger, name, workqueue.DefaultControllerRateLimiter())
+}
+
+// NewWorkerQueueWithRateLimiter returns a new worker queue for a given name and custom rate limiter.
+func NewWorkerQueueWithRateLimiter(handler Handler, logger *logrus.Entry, name string, rateLimiter workqueue.RateLimiter) *WorkerQueue {
 	return &WorkerQueue{
 		logger:      logger.WithField("queue", name),
-		queue:       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), name),
+		queue:       workqueue.NewNamedRateLimitingQueue(rateLimiter, name),
 		SyncHandler: handler,
 	}
 }
@@ -74,6 +79,21 @@ func (wq *WorkerQueue) Enqueue(obj interface{}) {
 	}
 	wq.logger.WithField("key", key).Info("Enqueuing key")
 	wq.queue.AddRateLimited(key)
+}
+
+// Enqueue puts the name of the runtime.Object in the
+// queue to be processed. If you need to send through an
+// explicit key, use an cache.ExplicitKey
+func (wq *WorkerQueue) EnqueueImmediately(obj interface{}) {
+	var key string
+	var err error
+	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+		err = errors.Wrap(err, "Error creating key for object")
+		runtime.HandleError(wq.logger.WithField("obj", obj), err)
+		return
+	}
+	wq.logger.WithField("key", key).Info("Enqueuing key immediately")
+	wq.queue.Add(key)
 }
 
 // runWorker is a long-running function that will continually call the

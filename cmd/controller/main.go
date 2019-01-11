@@ -60,7 +60,7 @@ const (
 	certFileFlag          = "cert-file"
 	keyFileFlag           = "key-file"
 	kubeconfigFlag        = "kubeconfig"
-	workers               = 2
+	workers               = 16
 	defaultResync         = 30 * time.Second
 )
 
@@ -71,6 +71,13 @@ var (
 // main starts the operator for the gameserver CRD
 func main() {
 	ctlConf := parseEnvFlags()
+
+	// logrus.SetFormatter(&logrus.TextFormatter{
+	// 	FullTimestamp:   true,
+	// 	TimestampFormat: "2006-01-02 15:04:05.000000",
+	// 	//ForceColors:     true,
+	// })
+
 	logger.WithField("version", pkg.Version).
 		WithField("ctlConf", ctlConf).Info("starting gameServer operator...")
 

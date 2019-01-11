@@ -17,6 +17,7 @@ package gameserversets
 import (
 	"encoding/json"
 	"sync"
+	"time"
 
 	"agones.dev/agones/pkg/apis/stable"
 	"agones.dev/agones/pkg/apis/stable/v1alpha1"
@@ -42,12 +43,21 @@ import (
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 )
 
 var (
 	// ErrNoGameServerSetOwner is returned when a GameServerSet can't be found as an owner
 	// for a GameServer
 	ErrNoGameServerSetOwner = errors.New("No GameServerSet owner for this GameServer")
+)
+
+const (
+	maxCreationParalellism         = 8
+	maxGameServerCreationsPerBatch = 16
+
+	maxDeletionParallelism         = 8
+	maxGameServerDeletionsPerBatch = 16
 )
 
 // Controller is a the GameServerSet controller
@@ -93,7 +103,8 @@ func NewController(
 	}
 
 	c.logger = runtime.NewLoggerWithType(c)
-	c.workerqueue = workerqueue.NewWorkerQueue(c.syncGameServerSet, c.logger, stable.GroupName+".GameServerSetController")
+	c.workerqueue = workerqueue.NewWorkerQueueWithRateLimiter(c.syncGameServerSet, c.logger, stable.GroupName+".GameServerSetController",
+		workqueue.NewItemFastSlowRateLimiter(100*time.Millisecond, 5*time.Second, 10))
 	health.AddLivenessCheck("gameserverset-workerqueue", healthcheck.Check(c.workerqueue.Healthy))
 
 	eventBroadcaster := record.NewBroadcaster()
@@ -109,7 +120,7 @@ func NewController(
 			oldGss := oldObj.(*v1alpha1.GameServerSet)
 			newGss := newObj.(*v1alpha1.GameServerSet)
 			if oldGss.Spec.Replicas != newGss.Spec.Replicas {
-				c.workerqueue.Enqueue(newGss)
+				c.workerqueue.EnqueueImmediately(newGss)
 			}
 		},
 	})
@@ -209,13 +220,14 @@ func (c *Controller) gameServerEventHandler(obj interface{}) {
 		}
 		return
 	}
-	c.workerqueue.Enqueue(gsSet)
+	c.workerqueue.EnqueueImmediately(gsSet)
 }
 
 // syncGameServer synchronises the GameServers for the Set,
 // making sure there are aways as many GameServers as requested
 func (c *Controller) syncGameServerSet(key string) error {
-	c.logger.WithField("key", key).Info("Synchronising")
+	c.logger.WithField("key", key).Info("syncGameServerSet")
+	defer c.logger.WithField("key", key).Info("syncGameServerSet finished")
 
 	// Convert the namespace/name string into a distinct namespace and name
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -244,12 +256,15 @@ func (c *Controller) syncGameServerSet(key string) error {
 
 	diff := gsSet.Spec.Replicas - int32(len(list))
 
+	c.logger.WithField("key", key).Info("synchronizing more game servers")
 	if err := c.syncMoreGameServers(gsSet, diff); err != nil {
 		return err
 	}
-	if err := c.syncLessGameServers(gsSet, diff); err != nil {
+	c.logger.WithField("key", key).Info("removing excessive game servers")
+	if err := c.removeExcessiveGameServers(gsSet, diff); err != nil {
 		return err
 	}
+	c.logger.WithField("key", key).Info("syncing game server state")
 	if err := c.syncGameServerSetState(gsSet, list); err != nil {
 		return err
 	}
@@ -280,27 +295,84 @@ func (c *Controller) syncMoreGameServers(gsSet *v1alpha1.GameServerSet, diff int
 		return nil
 	}
 	c.logger.WithField("diff", diff).WithField("gameserverset", gsSet.ObjectMeta.Name).Info("Adding more gameservers")
-	for i := int32(0); i < diff; i++ {
-		gs := gsSet.GameServer()
+
+	batchSize := int(diff)
+	haveMoreItems := false
+	if batchSize > maxGameServerCreationsPerBatch {
+		batchSize = maxGameServerCreationsPerBatch
+		haveMoreItems = true
+	}
+	if err := parallelize(generateNGameServers(batchSize, gsSet), maxCreationParalellism, func(gs *v1alpha1.GameServer) error {
 		gs, err := c.gameServerGetter.GameServers(gs.Namespace).Create(gs)
 		if err != nil {
 			return errors.Wrapf(err, "error creating gameserver for gameserverset %s", gsSet.ObjectMeta.Name)
 		}
+
 		c.recorder.Eventf(gsSet, corev1.EventTypeNormal, "SuccessfulCreate", "Created gameserver: %s", gs.ObjectMeta.Name)
+		return nil
+	}); err != nil {
+		return err
 	}
 
+	if haveMoreItems {
+		c.workerqueue.EnqueueImmediately(gsSet)
+	}
 	return nil
 }
 
-// syncLessGameServers removes Ready GameServers from the set of GameServers
-func (c *Controller) syncLessGameServers(gsSet *v1alpha1.GameServerSet, diff int32) error {
+func generateNGameServers(n int, gsSet *v1alpha1.GameServerSet) chan *v1alpha1.GameServer {
+	gameServers := make(chan *v1alpha1.GameServer)
+	go func() {
+		defer close(gameServers)
+
+		for i := 0; i < n; i++ {
+			gameServers <- gsSet.GameServer()
+		}
+	}()
+
+	return gameServers
+}
+
+// parallelize processes a channel of game server objects, invoking the provided callback for items in the channel with the specified degree of parallelism up to a limit.
+// Returns nil if all callbacks returned nil or one of the error responses, not necessarily the first one.
+func parallelize(gameServers chan *v1alpha1.GameServer, parallelism int, work func(gs *v1alpha1.GameServer) error) error {
+	errch := make(chan error, parallelism)
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			for it := range gameServers {
+				err := work(it)
+				if err != nil {
+					errch <- err
+					break
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errch)
+
+	for range gameServers {
+		// drain any remaining game servers in the channel, in case we did not consume them all
+	}
+
+	// return first error from the channel, or nil if all successful.
+	return <-errch
+}
+
+// removeExcessiveGameServers removes Ready GameServers from the set of GameServers
+func (c *Controller) removeExcessiveGameServers(gsSet *v1alpha1.GameServerSet, diff int32) error {
 	if diff >= 0 {
 		return nil
 	}
 	// easier to manage positive numbers
 	diff = -diff
 	c.logger.WithField("diff", diff).WithField("gameserverset", gsSet.ObjectMeta.Name).Info("Deleting gameservers")
-	count := int32(0)
 
 	// don't allow allocation state for GameServers to change
 	c.allocationMutex.Lock()
@@ -329,19 +401,46 @@ func (c *Controller) syncLessGameServers(gsSet *v1alpha1.GameServerSet, diff int
 		list = filterGameServersOnLeastFullNodes(list, diff)
 	}
 
+	// prepare a channel of game servers to be delete, ignoring the ones that are allocated or in the process of being deleted.
+	batchSize := maxGameServerDeletionsPerBatch
+	haveMoreItems := false
+	if batchSize > int(diff) {
+		batchSize = int(diff)
+	}
+
+	// create a buffered channel for game servers to delete and add them up to a batch size limit.
+	ch := make(chan *v1alpha1.GameServer, batchSize)
+	cnt := 0
 	for _, gs := range list {
-		if diff <= count {
-			return nil
+		if gs.Status.State == v1alpha1.GameServerStateAllocated || !gs.ObjectMeta.DeletionTimestamp.IsZero() {
+			// ignore
+			continue
+		}
+		cnt++
+		if cnt > batchSize {
+			// no more room in the batch, but there are more items in the 'list'.
+			// we will return error at the end of the batch to have the work retried.
+			haveMoreItems = true
+			break
+		}
+		ch <- gs
+	}
+	close(ch)
+
+	if err := parallelize(ch, maxDeletionParallelism, func(gs *v1alpha1.GameServer) error {
+		err := c.gameServerGetter.GameServers(gs.Namespace).Delete(gs.ObjectMeta.Name, nil)
+		if err != nil {
+			return errors.Wrapf(err, "error deleting gameserver for gameserverset %s", gsSet.ObjectMeta.Name)
 		}
 
-		if gs.Status.State != v1alpha1.GameServerStateAllocated {
-			err := c.gameServerGetter.GameServers(gs.Namespace).Delete(gs.ObjectMeta.Name, nil)
-			if err != nil {
-				return errors.Wrapf(err, "error deleting gameserver for gameserverset %s", gsSet.ObjectMeta.Name)
-			}
-			c.recorder.Eventf(gsSet, corev1.EventTypeNormal, "SuccessfulDelete", "Deleted GameServer: %s", gs.ObjectMeta.Name)
-			count++
-		}
+		c.recorder.Eventf(gsSet, corev1.EventTypeNormal, "SuccessfulDelete", "Deleted GameServer: %s", gs.ObjectMeta.Name)
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if haveMoreItems {
+		c.workerqueue.EnqueueImmediately(gsSet)
 	}
 
 	return nil

@@ -15,9 +15,11 @@
 package gameservers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"agones.dev/agones/pkg/apis/stable"
 	"agones.dev/agones/pkg/apis/stable/v1alpha1"
@@ -33,6 +35,8 @@ import (
 	"github.com/mattbaird/jsonpatch"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"go.opencensus.io/stats"
+	"go.opencensus.io/tag"
 	admv1beta1 "k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	extclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -49,6 +53,7 @@ import (
 	corelisterv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 )
 
 var (
@@ -72,9 +77,13 @@ type Controller struct {
 	nodeLister             corelisterv1.NodeLister
 	portAllocator          *PortAllocator
 	healthController       *HealthController
-	workerqueue            *workerqueue.WorkerQueue
-	allocationMutex        *sync.Mutex
-	stop                   <-chan struct {
+
+	newWorkQueue     *workerqueue.WorkerQueue
+	workerqueue      *workerqueue.WorkerQueue
+	startedWorkQueue *workerqueue.WorkerQueue
+
+	allocationMutex *sync.Mutex
+	stop            <-chan struct {
 	}
 	recorder record.EventRecorder
 }
@@ -124,20 +133,24 @@ func NewController(
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 	c.recorder = eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "gameserver-controller"})
 
-	c.workerqueue = workerqueue.NewWorkerQueue(c.syncGameServer, c.logger, stable.GroupName+".GameServerController")
+	c.workerqueue = workerqueue.NewWorkerQueueWithRateLimiter(c.syncGameServer, c.logger, stable.GroupName+".GameServerController",
+		workqueue.NewItemFastSlowRateLimiter(100*time.Millisecond, 5*time.Second, 10))
+	c.newWorkQueue = workerqueue.NewWorkerQueueWithRateLimiter(c.syncGameServer, c.logger, stable.GroupName+".GameServerController-New",
+		workqueue.NewItemFastSlowRateLimiter(100*time.Millisecond, 5*time.Second, 10))
 	health.AddLivenessCheck("gameserver-workerqueue", healthcheck.Check(c.workerqueue.Healthy))
+	health.AddLivenessCheck("gameserver-newWorkQueue", healthcheck.Check(c.newWorkQueue.Healthy))
 
 	wh.AddHandler("/mutate", v1alpha1.Kind("GameServer"), admv1beta1.Create, c.creationMutationHandler)
 	wh.AddHandler("/validate", v1alpha1.Kind("GameServer"), admv1beta1.Create, c.creationValidationHandler)
 
 	gsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: c.workerqueue.Enqueue,
+		AddFunc: c.queueBasedOnStatus,
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			// no point in processing unless there is a State change
 			oldGs := oldObj.(*v1alpha1.GameServer)
 			newGs := newObj.(*v1alpha1.GameServer)
 			if oldGs.Status.State != newGs.Status.State || oldGs.ObjectMeta.DeletionTimestamp != newGs.ObjectMeta.DeletionTimestamp {
-				c.workerqueue.Enqueue(newGs)
+				c.queueBasedOnStatus(newGs)
 			}
 		},
 	})
@@ -151,6 +164,7 @@ func NewController(
 				//  node name has changed -- i.e. it has been scheduled
 				if oldPod.Spec.NodeName != newPod.Spec.NodeName {
 					owner := metav1.GetControllerOf(newPod)
+					stats.RecordWithTags(context.Background(), []tag.Mutator{tag.Upsert(keyFleetName, "xxx")}, gameServerEnqueueRate.M(1))
 					c.workerqueue.Enqueue(cache.ExplicitKey(newPod.ObjectMeta.Namespace + "/" + owner.Name))
 				}
 			}
@@ -166,6 +180,28 @@ func NewController(
 	})
 
 	return c
+}
+
+func (c *Controller) queueBasedOnStatus(v interface{}) {
+	gs := v.(*v1alpha1.GameServer)
+	// if !gs.ObjectMeta.DeletionTimestamp.IsZero() {
+	// 	c.logger.WithField("gs", gs.Name).Infof("QUEUE: adding deleted GS to newWorkQueue")
+	// 	c.newWorkQueue.Enqueue(gs)
+	// 	return
+	// }
+	stats.RecordWithTags(context.Background(), []tag.Mutator{tag.Upsert(keyFleetName, gs.Labels[v1alpha1.FleetNameLabel])}, gameServerEnqueueRate.M(1))
+
+	switch gs.Status.State {
+	case v1alpha1.GameServerStatePortAllocation, v1alpha1.GameServerStateCreating, v1alpha1.GameServerStateStarting:
+		c.logger.WithField("gs", gs.Name).WithField("state", gs.Status.State).Infof("QUEUE: adding new GS to newWorkQueue")
+		c.newWorkQueue.Enqueue(gs)
+	// case v1alpha1.GameServerStateReady:
+	// 	c.logger.WithField("gs", gs.Name).WithField("state", gs.Status.State).Infof("QUEUE: ignoring state")
+	// 	// nothing to do
+	default:
+		c.logger.WithField("gs", gs.Name).WithField("state", gs.Status.State).Infof("QUEUE: adding existing GS to worker queue")
+		c.workerqueue.Enqueue(gs)
+	}
 }
 
 // creationMutationHandler is the handler for the mutating webhook that sets the
@@ -213,8 +249,6 @@ func (c *Controller) creationMutationHandler(review admv1beta1.AdmissionReview) 
 // creationValidationHandler that validates a GameServer when it is created
 // Should only be called on gameserver create operations.
 func (c *Controller) creationValidationHandler(review admv1beta1.AdmissionReview) (admv1beta1.AdmissionReview, error) {
-	c.logger.WithField("review", review).Info("creationValidationHandler")
-
 	obj := review.Request.Object
 	gs := &v1alpha1.GameServer{}
 	err := json.Unmarshal(obj.Raw, gs)
@@ -270,14 +304,26 @@ func (c *Controller) Run(workers int, stop <-chan struct{}) error {
 	// Run the Health Controller
 	go c.healthController.Run(stop)
 
-	c.workerqueue.Run(workers, stop)
+	c.logger.Infof("starting %v workers", workers)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		c.newWorkQueue.Run(workers, stop)
+	}()
+	go func() {
+		defer wg.Done()
+		c.workerqueue.Run(workers, stop)
+	}()
+	wg.Wait()
 	return nil
 }
 
 // syncGameServer synchronises the Pods for the GameServers.
 // and reacts to status changes that can occur through the client SDK
 func (c *Controller) syncGameServer(key string) error {
-	c.logger.WithField("key", key).Info("Synchronising")
+	t0 := time.Now()
+	c.logger.WithField("key", key).Info("Synchronising game server")
 
 	// Convert the namespace/name string into a distinct namespace and name
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -295,6 +341,17 @@ func (c *Controller) syncGameServer(key string) error {
 		}
 		return errors.Wrapf(err, "error retrieving GameServer %s from namespace %s", name, namespace)
 	}
+
+	originalState := string(gs.Status.State)
+
+	stats.RecordWithTags(context.Background(), []tag.Mutator{tag.Upsert(keyFleetName, gs.Labels[v1alpha1.FleetNameLabel])}, gameServerDequeueRate.M(1))
+	defer func() {
+		millis := int64(time.Since(t0).Nanoseconds()) / 1e6
+		stats.RecordWithTags(context.Background(), []tag.Mutator{
+			tag.Upsert(keyGameServerStatus, originalState),
+		}, gameServerSyncTimeMillis.M(millis))
+		c.logger.WithField("key", key).Infof("Synced game server from %v to %v in %v", originalState, time.Since(t0))
+	}()
 
 	if gs, err = c.syncGameServerDeletionTimestamp(gs); err != nil {
 		return err
@@ -327,7 +384,7 @@ func (c *Controller) syncGameServerDeletionTimestamp(gs *v1alpha1.GameServer) (*
 		return gs, nil
 	}
 
-	c.logger.WithField("gs", gs).Info("Syncing with Deletion Timestamp")
+	c.logger.WithField("gs", gs.Name).Info("Syncing with Deletion Timestamp")
 	pods, err := c.listGameServerPods(gs)
 	if err != nil {
 		return gs, err
@@ -354,7 +411,7 @@ func (c *Controller) syncGameServerDeletionTimestamp(gs *v1alpha1.GameServer) (*
 		}
 	}
 	gsCopy.ObjectMeta.Finalizers = fin
-	c.logger.WithField("gs", gsCopy).Infof("No pods found, removing finalizer %s", stable.GroupName)
+	c.logger.WithField("gs", gsCopy.Name).Infof("No pods found, removing finalizer %s", stable.GroupName)
 	gs, err = c.gameServerGetter.GameServers(gsCopy.ObjectMeta.Namespace).Update(gsCopy)
 	return gs, errors.Wrapf(err, "error removing finalizer for GameServer %s", gsCopy.ObjectMeta.Name)
 }
@@ -370,7 +427,7 @@ func (c *Controller) syncGameServerPortAllocationState(gs *v1alpha1.GameServer) 
 	gsCopy.Status.State = v1alpha1.GameServerStateCreating
 	c.recorder.Event(gs, corev1.EventTypeNormal, string(gs.Status.State), "Port allocated")
 
-	c.logger.WithField("gs", gsCopy).Info("Syncing Port Allocation GameServerState")
+	c.logger.WithField("gs", gsCopy.Name).Info("Syncing Port Allocation GameServerState")
 	gs, err := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
 	if err != nil {
 		// if the GameServer doesn't get updated with the port data, then put the port
@@ -389,7 +446,7 @@ func (c *Controller) syncGameServerCreatingState(gs *v1alpha1.GameServer) (*v1al
 		return gs, nil
 	}
 
-	c.logger.WithField("gs", gs).Info("Syncing Create State")
+	c.logger.WithField("gs", gs.Name).Info("Syncing Create State")
 
 	// Wait for pod cache sync, so that we don't end up with multiple pods for a GameServer
 	if !(cache.WaitForCacheSync(c.stop, c.podSynced)) {
@@ -527,7 +584,7 @@ func (c *Controller) syncGameServerStartingState(gs *v1alpha1.GameServer) (*v1al
 		return gs, nil
 	}
 
-	c.logger.WithField("gs", gs).Info("Syncing Starting GameServerState")
+	c.logger.WithField("gs", gs.Name).Info("Syncing Starting GameServerState")
 
 	// there should be a pod (although it may not have a scheduled container),
 	// so if there is an error of any kind, then move this to queue backoff
@@ -582,7 +639,7 @@ func (c *Controller) syncGameServerRequestReadyState(gs *v1alpha1.GameServer) (*
 		return gs, nil
 	}
 
-	c.logger.WithField("gs", gs).Info("Syncing RequestReady State")
+	c.logger.WithField("gs", gs.Name).Info("Syncing RequestReady State")
 
 	gsCopy := gs.DeepCopy()
 
@@ -623,7 +680,7 @@ func (c *Controller) syncGameServerShutdownState(gs *v1alpha1.GameServer) error 
 		return nil
 	}
 
-	c.logger.WithField("gs", gs).Info("Syncing Shutdown State")
+	c.logger.WithField("gs", gs.Name).Info("Syncing Shutdown State")
 	// be explicit about where to delete. We only need to wait for the Pod to be removed, which we handle with our
 	// own finalizer.
 	p := metav1.DeletePropagationBackground
