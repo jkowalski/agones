@@ -350,7 +350,7 @@ func (c *Controller) syncGameServer(key string) error {
 		stats.RecordWithTags(context.Background(), []tag.Mutator{
 			tag.Upsert(keyGameServerStatus, originalState),
 		}, gameServerSyncTimeMillis.M(millis))
-		c.logger.WithField("key", key).Infof("Synced game server from %v to %v in %v", originalState, time.Since(t0))
+		c.logger.WithField("key", key).Infof("Synced game server in state %v in %v", originalState, time.Since(t0))
 	}()
 
 	if gs, err = c.syncGameServerDeletionTimestamp(gs); err != nil {
@@ -373,6 +373,26 @@ func (c *Controller) syncGameServer(key string) error {
 	}
 
 	return nil
+}
+
+func (c *Controller) updateGameServer(gs *v1alpha1.GameServer) (*v1alpha1.GameServer, error) {
+	t0 := time.Now()
+	coll := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace)
+	t1 := time.Now()
+	result, err := coll.Update(gs)
+	t2 := time.Now()
+	c.logger.Infof("updated game server in %v and %v", t1.Sub(t0), t2.Sub(t1))
+	return result, err
+}
+
+func (c *Controller) updateGameServerStatus(gs *v1alpha1.GameServer) (*v1alpha1.GameServer, error) {
+	t0 := time.Now()
+	coll := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace)
+	t1 := time.Now()
+	result, err := coll.UpdateStatus(gs)
+	t2 := time.Now()
+	c.logger.Infof("updated game server in %v and %v", t1.Sub(t0), t2.Sub(t1))
+	return result, err
 }
 
 // syncGameServerDeletionTimestamp if the deletion timestamp is non-zero
@@ -412,7 +432,7 @@ func (c *Controller) syncGameServerDeletionTimestamp(gs *v1alpha1.GameServer) (*
 	}
 	gsCopy.ObjectMeta.Finalizers = fin
 	c.logger.WithField("gs", gsCopy.Name).Infof("No pods found, removing finalizer %s", stable.GroupName)
-	gs, err = c.gameServerGetter.GameServers(gsCopy.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err = c.updateGameServer(gsCopy)
 	return gs, errors.Wrapf(err, "error removing finalizer for GameServer %s", gsCopy.ObjectMeta.Name)
 }
 
@@ -422,19 +442,25 @@ func (c *Controller) syncGameServerPortAllocationState(gs *v1alpha1.GameServer) 
 		return gs, nil
 	}
 
+	t0 := time.Now()
 	gsCopy := c.portAllocator.Allocate(gs.DeepCopy())
 
 	gsCopy.Status.State = v1alpha1.GameServerStateCreating
+	t1 := time.Now()
 	c.recorder.Event(gs, corev1.EventTypeNormal, string(gs.Status.State), "Port allocated")
 
 	c.logger.WithField("gs", gsCopy.Name).Info("Syncing Port Allocation GameServerState")
-	gs, err := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err := c.updateGameServer(gsCopy)
+	t2 := time.Now()
 	if err != nil {
 		// if the GameServer doesn't get updated with the port data, then put the port
 		// back in the pool, as it will get retried on the next pass
 		c.portAllocator.DeAllocate(gsCopy)
 		return gs, errors.Wrapf(err, "error updating GameServer %s to default values", gs.Name)
 	}
+	t3 := time.Now()
+
+	c.logger.WithField("gs", gsCopy.Name).Infof("port allocation timings %v %v %v", t1.Sub(t0), t2.Sub(t1), t3.Sub(t2))
 
 	return gs, nil
 }
@@ -468,7 +494,7 @@ func (c *Controller) syncGameServerCreatingState(gs *v1alpha1.GameServer) (*v1al
 
 	gsCopy := gs.DeepCopy()
 	gsCopy.Status.State = v1alpha1.GameServerStateStarting
-	gs, err = c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err = c.updateGameServer(gsCopy)
 	if err != nil {
 		return gs, errors.Wrapf(err, "error updating GameServer %s to Starting state", gs.Name)
 	}
@@ -601,7 +627,7 @@ func (c *Controller) syncGameServerStartingState(gs *v1alpha1.GameServer) (*v1al
 	}
 
 	gsCopy.Status.State = v1alpha1.GameServerStateScheduled
-	gs, err = c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err = c.updateGameServer(gsCopy)
 	if err != nil {
 		return gs, errors.Wrapf(err, "error updating GameServer %s to Scheduled state", gs.Name)
 	}
@@ -662,7 +688,7 @@ func (c *Controller) syncGameServerRequestReadyState(gs *v1alpha1.GameServer) (*
 	}
 
 	gsCopy.Status.State = v1alpha1.GameServerStateReady
-	gs, err := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err := c.updateGameServer(gsCopy)
 	if err != nil {
 		return gs, errors.Wrapf(err, "error setting Ready, Port and address on GameServer %s Status", gs.ObjectMeta.Name)
 	}

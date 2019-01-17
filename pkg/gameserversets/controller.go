@@ -390,12 +390,12 @@ func (c *Controller) removeExcessiveGameServers(gsSet *v1alpha1.GameServerSet, d
 		return err
 	}
 
-	// count anything that is already being deleted
-	for _, gs := range list {
-		if !gs.ObjectMeta.DeletionTimestamp.IsZero() {
-			diff--
-		}
-	}
+	// // count anything that is already being deleted
+	// for _, gs := range list {
+	// 	if !gs.ObjectMeta.DeletionTimestamp.IsZero() {
+	// 		diff--
+	// 	}
+	// }
 
 	if gsSet.Spec.Scheduling == v1alpha1.Packed {
 		list = filterGameServersOnLeastFullNodes(list, diff)

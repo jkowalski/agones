@@ -91,6 +91,9 @@ func main() {
 		logger.WithError(err).Fatal("Could not create in cluster config")
 	}
 
+	clientConf.QPS = 100
+	clientConf.Burst = 200
+
 	kubeClient, err := kubernetes.NewForConfig(clientConf)
 	if err != nil {
 		logger.WithError(err).Fatal("Could not create the kubernetes clientset")
