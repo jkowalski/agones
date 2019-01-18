@@ -28,8 +28,19 @@ agones:
   controller:
     resources: {}
     nodeSelector: {}
-    tolerations: []
-    affinity: {}
+    tolerations:
+    - key: "stable.agones.dev/agones-system"
+      operator: "Equal"
+      value: "true"
+      effect: "NoExecute"
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 1
+          preference:
+            matchExpressions:
+              - key: stable.agones.dev/agones-system
+                operator: Exists
     generateTLS: true
     safeToEvict: false
     http:

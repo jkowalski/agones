@@ -361,14 +361,12 @@ pprof-web:
 # setup prometheus in the current cluster by default Persistent Volume Claims are requested.
 setup-prometheus: PVC ?= true
 setup-prometheus: PV_SIZE ?= 64Gi
-setup-prometheus: SCRAPE_INTERVAL=10s
+setup-prometheus: SCRAPE_INTERVAL=30s
 setup-prometheus:
 	$(DOCKER_RUN) \
 		helm upgrade --install --wait prom stable/prometheus --namespace metrics \
-		--set alertmanager.enabled=false,pushgateway.enabled=false \
-		--set kubeStateMetrics.enabled=false,nodeExporter.enabled=false \
-		--set pushgateway.enabled=false \
-		--set server.global.scrape_interval=$(SCRAPE_INTERVAL),server.persistentVolume.enabled=$(PVC),server.persistentVolume.size=$(PV_SIZE),server.resources.requests.memory=1Gi,server.resources.requests.cpu=2
+		--set server.global.scrape_interval=$(SCRAPE_INTERVAL),server.persistentVolume.enabled=$(PVC),server.persistentVolume.size=$(PV_SIZE) \
+		-f $(mount_path)/build/prometheus.yaml
 
 # setup grafana in the current cluster with datasource and dashboards ready for use with agones
 # by default Persistent Volume Claims are requested.

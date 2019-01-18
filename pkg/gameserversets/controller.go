@@ -58,6 +58,8 @@ const (
 
 	maxDeletionParallelism         = 8
 	maxGameServerDeletionsPerBatch = 16
+
+	maxStarting = 750
 )
 
 // Controller is a the GameServerSet controller
@@ -250,6 +252,14 @@ func (c *Controller) syncGameServerSet(key string) error {
 	if err != nil {
 		return err
 	}
+
+	startingCount := 0
+	for _, gs := range list {
+		if gs.Status.State == v1alpha1.GameServerStateStarting {
+			startingCount++
+		}
+	}
+
 	if err := c.syncUnhealthyGameServers(gsSet, list); err != nil {
 		return err
 	}
@@ -257,7 +267,7 @@ func (c *Controller) syncGameServerSet(key string) error {
 	diff := gsSet.Spec.Replicas - int32(len(list))
 
 	c.logger.WithField("key", key).Info("synchronizing more game servers")
-	if err := c.syncMoreGameServers(gsSet, diff); err != nil {
+	if err := c.syncMoreGameServers(gsSet, int(diff), startingCount); err != nil {
 		return err
 	}
 	c.logger.WithField("key", key).Info("removing excessive game servers")
@@ -270,6 +280,19 @@ func (c *Controller) syncGameServerSet(key string) error {
 	}
 
 	return nil
+}
+
+func isPodStarting(gs *v1alpha1.GameServer) bool {
+	switch gs.Status.State {
+	case v1alpha1.GameServerStateCreating:
+		return true
+	case v1alpha1.GameServerStatePortAllocation:
+		return true
+	case v1alpha1.GameServerStateStarting:
+		return true
+	default:
+		return false
+	}
 }
 
 // syncUnhealthyGameServers deletes any unhealthy game servers (that are not already being deleted)
@@ -290,28 +313,34 @@ func (c *Controller) syncUnhealthyGameServers(gsSet *v1alpha1.GameServerSet, lis
 }
 
 // syncMoreGameServers adds diff more GameServers to the set
-func (c *Controller) syncMoreGameServers(gsSet *v1alpha1.GameServerSet, diff int32) error {
+func (c *Controller) syncMoreGameServers(gsSet *v1alpha1.GameServerSet, diff int, startingCount int) error {
 	if diff <= 0 {
 		return nil
 	}
+	batchSize := diff
+	haveMoreItems := false
 	c.logger.WithField("diff", diff).WithField("gameserverset", gsSet.ObjectMeta.Name).Info("Adding more gameservers")
 
-	batchSize := int(diff)
-	haveMoreItems := false
+	if startingCount+batchSize > maxStarting {
+		batchSize = maxStarting - startingCount
+		haveMoreItems = true
+	}
 	if batchSize > maxGameServerCreationsPerBatch {
 		batchSize = maxGameServerCreationsPerBatch
 		haveMoreItems = true
 	}
-	if err := parallelize(generateNGameServers(batchSize, gsSet), maxCreationParalellism, func(gs *v1alpha1.GameServer) error {
-		gs, err := c.gameServerGetter.GameServers(gs.Namespace).Create(gs)
-		if err != nil {
-			return errors.Wrapf(err, "error creating gameserver for gameserverset %s", gsSet.ObjectMeta.Name)
-		}
+	if batchSize > 0 {
+		if err := parallelize(generateNGameServers(batchSize, gsSet), maxCreationParalellism, func(gs *v1alpha1.GameServer) error {
+			gs, err := c.gameServerGetter.GameServers(gs.Namespace).Create(gs)
+			if err != nil {
+				return errors.Wrapf(err, "error creating gameserver for gameserverset %s", gsSet.ObjectMeta.Name)
+			}
 
-		c.recorder.Eventf(gsSet, corev1.EventTypeNormal, "SuccessfulCreate", "Created gameserver: %s", gs.ObjectMeta.Name)
-		return nil
-	}); err != nil {
-		return err
+			c.recorder.Eventf(gsSet, corev1.EventTypeNormal, "SuccessfulCreate", "Created gameserver: %s", gs.ObjectMeta.Name)
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 
 	if haveMoreItems {

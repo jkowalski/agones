@@ -60,7 +60,7 @@ const (
 	certFileFlag          = "cert-file"
 	keyFileFlag           = "key-file"
 	kubeconfigFlag        = "kubeconfig"
-	workers               = 16
+	workers               = 64
 	defaultResync         = 30 * time.Second
 )
 
