@@ -17,7 +17,8 @@ kind: Fleet
 metadata:
   name: simple-udp
 spec:
-  replicas: 2
+  replicas: 0
+  scheduling: Distributed
   template:
     spec:
       ports:

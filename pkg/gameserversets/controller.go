@@ -59,7 +59,7 @@ const (
 	maxDeletionParallelism         = 8
 	maxGameServerDeletionsPerBatch = 16
 
-	maxStarting = 750
+	maxStarting = 5000
 )
 
 // Controller is a the GameServerSet controller

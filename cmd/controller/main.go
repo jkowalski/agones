@@ -60,7 +60,7 @@ const (
 	certFileFlag          = "cert-file"
 	keyFileFlag           = "key-file"
 	kubeconfigFlag        = "kubeconfig"
-	workers               = 64
+	workers               = 128
 	defaultResync         = 30 * time.Second
 )
 
@@ -91,8 +91,8 @@ func main() {
 		logger.WithError(err).Fatal("Could not create in cluster config")
 	}
 
-	clientConf.QPS = 100
-	clientConf.Burst = 200
+	clientConf.QPS = 500
+	clientConf.Burst = 1000
 
 	kubeClient, err := kubernetes.NewForConfig(clientConf)
 	if err != nil {
