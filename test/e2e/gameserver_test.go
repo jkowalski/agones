@@ -16,6 +16,8 @@ package e2e
 
 import (
 	"fmt"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +84,72 @@ func TestSDKSetLabel(t *testing.T) {
 
 	assert.Nil(t, err)
 	assert.NotEmpty(t, gs.ObjectMeta.Labels["stable.agones.dev/sdk-timestamp"])
+}
+
+// nolint:dupl
+func TestSDKSetLabelRace(t *testing.T) {
+	t.Parallel()
+	gs := defaultGameServer()
+	readyGs, err := framework.CreateGameServerAndWaitUntilReady(defaultNs, gs)
+	if err != nil {
+		t.Fatalf("Could not get a GameServer ready: %v", err)
+	}
+
+	const rounds = 50
+
+	lastValue := fmt.Sprintf("val-%03v", rounds)
+
+	// goroutine that will set 2 labels N times on a game server.
+	go func() {
+		for i := 1; i <= rounds; i++ {
+			setSimpleUDPLabel(t, readyGs, "foo", fmt.Sprintf("val-%03v", i))
+			time.Sleep(1 * time.Millisecond)
+			setSimpleUDPLabel(t, readyGs, "bar", fmt.Sprintf("val-%03v", i))
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	var lastFoo string
+	var lastBar string
+
+	// now wait until both foo and bar reach "val-100"
+	err = wait.PollImmediate(100*time.Millisecond, 30*time.Second, func() (bool, error) {
+		gs, err = framework.AgonesClient.StableV1alpha1().GameServers(defaultNs).Get(readyGs.ObjectMeta.Name, metav1.GetOptions{})
+		if err != nil {
+			return true, err
+		}
+
+		foo := gs.Labels["stable.agones.dev/sdk-foo"]
+		bar := gs.Labels["stable.agones.dev/sdk-bar"]
+
+		log.Printf("got foo %v (previous %v) bar %v (previous %v)", foo, lastFoo, bar, lastBar)
+		if lastFoo != "" && foo < lastFoo {
+			t.Fatalf("foo went back in time %v, was %v", foo, lastFoo)
+		}
+		lastFoo = foo
+
+		if lastBar != "" && bar < lastBar {
+			t.Fatalf("bar went back in time %v, was %v", bar, lastBar)
+		}
+		lastBar = bar
+
+		return foo == lastValue && bar == lastValue, nil
+	})
+
+	time.Sleep(3 * time.Second)
+
+	assert.NoError(t, err)
+}
+
+func setSimpleUDPLabel(t *testing.T, gs *v1alpha1.GameServer, key, value string) {
+	reply, err := e2eframework.PingGameServer("LABEL "+key+" "+value, fmt.Sprintf("%s:%d", gs.Status.Address, gs.Status.Ports[0].Port))
+	if err != nil {
+		t.Fatalf("Could ping GameServer: %v", err)
+	}
+
+	if !strings.HasPrefix(reply, "ACK") {
+		t.Fatalf("invalid response")
+	}
 }
 
 // nolint:dupl
