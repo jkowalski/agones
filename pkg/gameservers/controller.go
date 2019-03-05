@@ -69,6 +69,7 @@ type Controller struct {
 	podGetter              typedcorev1.PodsGetter
 	podLister              corelisterv1.PodLister
 	podSynced              cache.InformerSynced
+	gameServerInformer     cache.SharedIndexInformer
 	gameServerGetter       getterv1alpha1.GameServersGetter
 	gameServerLister       listerv1alpha1.GameServerLister
 	gameServerSynced       cache.InformerSynced
@@ -111,6 +112,7 @@ func NewController(
 		podGetter:              kubeClient.CoreV1(),
 		podLister:              pods.Lister(),
 		podSynced:              pods.Informer().HasSynced,
+		gameServerInformer:     gsInformer,
 		gameServerGetter:       agonesClient.StableV1alpha1(),
 		gameServerLister:       gameServers.Lister(),
 		gameServerSynced:       gsInformer.HasSynced,
@@ -413,7 +415,7 @@ func (c *Controller) syncGameServerDeletionTimestamp(gs *v1alpha1.GameServer) (*
 	}
 	gsCopy.ObjectMeta.Finalizers = fin
 	c.loggerForGameServer(gsCopy).Infof("No pods found, removing finalizer %s", stable.GroupName)
-	gs, err = c.gameServerGetter.GameServers(gsCopy.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err = c.updateGameServer(gsCopy)
 	return gs, errors.Wrapf(err, "error removing finalizer for GameServer %s", gsCopy.ObjectMeta.Name)
 }
 
@@ -429,7 +431,7 @@ func (c *Controller) syncGameServerPortAllocationState(gs *v1alpha1.GameServer) 
 	c.recorder.Event(gs, corev1.EventTypeNormal, string(gs.Status.State), "Port allocated")
 
 	c.loggerForGameServer(gsCopy).Info("Syncing Port Allocation GameServerState")
-	gs, err := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err := c.updateGameServer(gsCopy)
 	if err != nil {
 		// if the GameServer doesn't get updated with the port data, then put the port
 		// back in the pool, as it will get retried on the next pass
@@ -472,7 +474,7 @@ func (c *Controller) syncGameServerCreatingState(gs *v1alpha1.GameServer) (*v1al
 
 	gsCopy := gs.DeepCopy()
 	gsCopy.Status.State = v1alpha1.GameServerStateStarting
-	gs, err = c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err = c.updateGameServer(gsCopy)
 	if err != nil {
 		return gs, errors.Wrapf(err, "error updating GameServer %s to Starting state", gs.Name)
 	}
@@ -505,7 +507,7 @@ func (c *Controller) syncDevelopmentGameServer(gs *v1alpha1.GameServer) (*v1alph
 	gsCopy.Status.Ports = ports
 	gsCopy.Status.Address = devIPAddress
 	gsCopy.Status.NodeName = devIPAddress
-	gs, err := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err := c.updateGameServer(gsCopy)
 	if err != nil {
 		return gs, errors.Wrapf(err, "error updating GameServer %s to %v status", gs.Name, gs.Status)
 	}
@@ -645,7 +647,7 @@ func (c *Controller) syncGameServerStartingState(gs *v1alpha1.GameServer) (*v1al
 	}
 
 	gsCopy.Status.State = v1alpha1.GameServerStateScheduled
-	gs, err = c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err = c.updateGameServer(gsCopy)
 	if err != nil {
 		return gs, errors.Wrapf(err, "error updating GameServer %s to Scheduled state", gs.Name)
 	}
@@ -672,6 +674,19 @@ func (c *Controller) applyGameServerAddressAndPort(gs *v1alpha1.GameServer, pod 
 	}
 
 	return gs, nil
+}
+
+func (c *Controller) updateGameServer(gs *v1alpha1.GameServer) (*v1alpha1.GameServer, error) {
+	newGs, err := c.gameServerGetter.GameServers(gs.Namespace).Update(gs)
+	if err != nil {
+		return newGs, err
+	}
+
+	// NOTE: there's a very slight race condition here, it is possible that right after the update
+	// some external party will modify the GS and we will overwrite the cache with old data in the next line.
+	// this is fine, because in this rare case the informer will resync after 30 seconds.
+	c.gameServerInformer.GetStore().Update(newGs) //nolint:err
+	return newGs, nil
 }
 
 // syncGameServerRequestReadyState checks if the Game Server is Requesting to be ready,
@@ -709,7 +724,7 @@ func (c *Controller) syncGameServerRequestReadyState(gs *v1alpha1.GameServer) (*
 	}
 
 	gsCopy.Status.State = v1alpha1.GameServerStateReady
-	gs, err := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gs, err := c.updateGameServer(gsCopy)
 	if err != nil {
 		return gs, errors.Wrapf(err, "error setting Ready, Port and address on GameServer %s Status", gs.ObjectMeta.Name)
 	}
@@ -743,7 +758,7 @@ func (c *Controller) moveToErrorState(gs *v1alpha1.GameServer, msg string) (*v1a
 	copy := gs.DeepCopy()
 	copy.Status.State = v1alpha1.GameServerStateError
 
-	gs, err := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(copy)
+	gs, err := c.updateGameServer(copy)
 	if err != nil {
 		return gs, errors.Wrapf(err, "error moving GameServer %s to Error State", gs.ObjectMeta.Name)
 	}

@@ -70,6 +70,7 @@ type Controller struct {
 	gameServerGetter    getterv1alpha1.GameServersGetter
 	gameServerLister    listerv1alpha1.GameServerLister
 	gameServerSynced    cache.InformerSynced
+	gameServerInformer  cache.SharedIndexInformer
 	gameServerSetGetter getterv1alpha1.GameServerSetsGetter
 	gameServerSetLister listerv1alpha1.GameServerSetLister
 	gameServerSetSynced cache.InformerSynced
@@ -98,6 +99,7 @@ func NewController(
 		gameServerGetter:    agonesClient.StableV1alpha1(),
 		gameServerLister:    gameServers.Lister(),
 		gameServerSynced:    gsInformer.HasSynced,
+		gameServerInformer:  gsInformer,
 		gameServerSetGetter: agonesClient.StableV1alpha1(),
 		gameServerSetLister: gameServerSets.Lister(),
 		gameServerSetSynced: gsSetInformer.HasSynced,
@@ -468,6 +470,9 @@ func (c *Controller) addMoreGameServers(gsSet *v1alpha1.GameServerSet, count int
 		if err != nil {
 			return errors.Wrapf(err, "error creating gameserver for gameserverset %s", gsSet.ObjectMeta.Name)
 		}
+
+		// ignore the error, the informer will populate the cache eventually
+		c.gameServerInformer.GetStore().Add(gs) //nolint:errcheck
 
 		c.stateCache.forGameServerSet(gsSet).created(gs)
 		c.recorder.Eventf(gsSet, corev1.EventTypeNormal, "SuccessfulCreate", "Created gameserver: %s", gs.ObjectMeta.Name)
